@@ -6,6 +6,14 @@ import importlib
 import os
 import tempfile
 from functools import partial
+import importlib.util
+
+# --- VLLM SERVER MANAGEMENT START ---
+import subprocess
+import sys
+import time
+import httpx
+# --- VLLM SERVER MANAGEMENT END ---
 
 from pypdf import PdfReader
 from tqdm import tqdm
@@ -17,9 +25,9 @@ from olmocr.image_utils import convert_image_to_pdf_bytes
 def parse_method_arg(method_arg):
     """
     Parse a method configuration string of the form:
-       method_name[:key=value[:key2=value2...]]
+        method_name[:key=value[:key2=value2...]]
     Returns:
-       (method_name, kwargs_dict, folder_name)
+        (method_name, kwargs_dict, folder_name)
     """
     parts = method_arg.split(":")
     name = parts[0]
@@ -194,6 +202,29 @@ async def process_pdfs(config, pdf_directory, data_directory, repeats, remove_te
             print(f"Completed {completed} out of {len(limited_tasks)} tasks for {candidate}")
 
 
+# --- VLLM SERVER MANAGEMENT START ---
+async def wait_for_server_ready(url, timeout=120):
+    """เช็ค health endpoint ของ server จนกว่าจะพร้อมใช้งานหรือหมดเวลา"""
+    start_time = time.time()
+    print("Waiting for VLLM server to be ready...")
+    async with httpx.AsyncClient() as client:
+        while time.time() - start_time < timeout:
+            try:
+                response = await client.get(url)
+                if response.status_code == 200:
+                    print("VLLM server is ready.")
+                    return True
+            except httpx.ConnectError:
+                # Server ยังไม่พร้อม รอแล้วลองใหม่
+                await asyncio.sleep(2)
+            except Exception as e:
+                print(f"An error occurred while waiting for the server: {e}")
+                await asyncio.sleep(2)
+    print("Timeout waiting for VLLM server.")
+    return False
+# --- VLLM SERVER MANAGEMENT END ---
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run PDF conversion using specified OCR methods and extra parameters.")
     parser.add_argument(
@@ -219,9 +250,11 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
-    # Mapping of method names to a tuple: (module path, function name)
+    # --- START CHANGES 1 ---
+    # แก้ไข path ของ olmocr_pipeline ให้เป็น file path
     available_methods = {
-        "olmocr_pipeline": ("olmocr.bench.runners.run_olmocr_pipeline", "run_olmocr_pipeline"),
+        # **สำคัญ** ให้แน่ใจว่า path นี้ถูกต้องตามโครงสร้างโปรเจกต์ของคุณ
+        "olmocr_pipeline": ("olmocr/olmocr/bench/runners/run_olmocr_pipeline.py", "run_olmocr_pipeline"),
         "gotocr": ("olmocr.bench.runners.run_gotocr", "run_gotocr"),
         "nanonetsocr": ("olmocr.bench.runners.run_nanonetsocr", "run_nanonetsocr"),
         "marker": ("olmocr.bench.runners.run_marker", "run_marker"),
@@ -241,14 +274,63 @@ if __name__ == "__main__":
         method_name, extra_kwargs, folder_name = parse_method_arg(method_arg)
         if method_name not in available_methods:
             parser.error(f"Unknown method: {method_name}. " f"Available methods: {', '.join(available_methods.keys())}")
-        module_path, function_name = available_methods[method_name]
-        # Dynamically import the module and get the function.
-        module = importlib.import_module(module_path)
-        function = getattr(module, function_name)
+        
+        path_or_module, function_name = available_methods[method_name]
+        
+        # --- START CHANGES 2 ---
+        # เพิ่มเงื่อนไขเพื่อโหลดโมดูลตามประเภท (path หรือ module name)
+        if path_or_module.endswith(".py"):
+            # โหลดจาก file path โดยตรง
+            module_name_for_spec = os.path.splitext(os.path.basename(path_or_module))[0]
+            spec = importlib.util.spec_from_file_location(module_name_for_spec, path_or_module)
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            function = getattr(module, function_name)
+        else:
+            # โหลดแบบปกติ (จาก library)
+            module = importlib.import_module(path_or_module)
+            function = getattr(module, function_name)
+        
         config[method_name] = {"method": function, "kwargs": extra_kwargs, "folder_name": folder_name}
-
+    
     data_directory = args.dir
     pdf_directory = os.path.join(data_directory, "pdfs")
 
-    # Run the async process function with the parallel argument
-    asyncio.run(process_pdfs(config, pdf_directory, data_directory, args.repeats, args.remove_text, args.force, args.parallel))
+    # --- VLLM SERVER MANAGEMENT START ---
+    vllm_process = None
+    # เช็คว่าผู้ใช้ต้องการรัน olmocr_pipeline หรือไม่
+    run_vllm = any(parse_method_arg(m)[0] == 'olmocr_pipeline' for m in args.methods)
+
+    if run_vllm:
+        print("`olmocr_pipeline` method requested. Starting VLLM server...")
+        # ใช้ sys.executable เพื่อให้แน่ใจว่าใช้ python interpreter เดียวกัน
+        command = [
+            sys.executable, "-m", "vllm.entrypoints.openai.api_server",
+            "--model", "allenai/olmOCR-7B-0225-preview",
+            "--trust-remote-code"
+        ]
+        # เริ่ม VLLM server เป็น background process
+        vllm_process = subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    
+    try:
+        if vllm_process:
+            # รอให้ server พร้อม
+            server_ready = asyncio.run(wait_for_server_ready("http://localhost:8000/health"))
+            if not server_ready:
+                raise RuntimeError("VLLM server failed to start.")
+
+        # รันกระบวนการแปลงไฟล์ PDF หลัก
+        asyncio.run(process_pdfs(config, pdf_directory, data_directory, args.repeats, args.remove_text, args.force, args.parallel))
+
+    finally:
+        # บล็อก finally จะทำงานเสมอ ไม่ว่า try จะสำเร็จหรือเกิด error
+        if vllm_process:
+            print("Processing finished. Shutting down VLLM server...")
+            vllm_process.terminate() # ส่งสัญญาณให้ปิด process
+            try:
+                vllm_process.wait(timeout=10) # รอ 10 วินาทีให้ process ปิดสนิท
+                print("VLLM server shut down successfully.")
+            except subprocess.TimeoutExpired:
+                print("VLLM server did not shut down gracefully. Forcing termination.")
+                vllm_process.kill() # ถ้ายังไม่ปิด ให้บังคับปิด
+    # --- VLLM SERVER MANAGEMENT END ---
