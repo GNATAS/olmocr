@@ -254,7 +254,7 @@ if __name__ == "__main__":
     # แก้ไข path ของ olmocr_pipeline ให้เป็น file path
     available_methods = {
         # **สำคัญ** ให้แน่ใจว่า path นี้ถูกต้องตามโครงสร้างโปรเจกต์ของคุณ
-        "olmocr_pipeline": ("olmocr/olmocr/bench/runners/run_olmocr_pipeline.py", "run_olmocr_pipeline"),
+        "olmocr_pipeline": ("bench.runners.run_olmocr_pipeline", "run_olmocr_pipeline"),
         "gotocr": ("olmocr.bench.runners.run_gotocr", "run_gotocr"),
         "nanonetsocr": ("olmocr.bench.runners.run_nanonetsocr", "run_nanonetsocr"),
         "marker": ("olmocr.bench.runners.run_marker", "run_marker"),
