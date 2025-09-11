@@ -307,7 +307,8 @@ if __name__ == "__main__":
         command = [
             sys.executable, "-m", "vllm.entrypoints.openai.api_server",
             "--model", "allenai/olmOCR-7B-0225-preview",
-            "--trust-remote-code"
+            "--trust-remote-code",
+            "--gpu-memory-utilization", "0.70"
         ]
         # เริ่ม VLLM server เป็น background process
         vllm_process = subprocess.Popen(command)
