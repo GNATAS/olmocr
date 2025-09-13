@@ -241,6 +241,25 @@ if __name__ == "__main__":
         default=os.path.join(os.path.dirname(__file__), "sample_data"),
         help="Path to the data folder in which to save outputs, pdfs should be in /pdfs folder within it.",
     )
+    
+    parser.add_argument(
+        "--model",
+        type=str,
+        default="allenai/olmOCR-7B-0225-preview",
+        help="The model identifier to be used by the VLLM server.",
+    )
+    parser.add_argument(
+        "--gpu-memory-utilization",
+        type=float,
+        default=0.9,
+        help="GPU memory utilization for VLLM server (e.g., 0.9 for 90%%).",
+    )
+    parser.add_argument(
+        "--max-model-len",
+        type=int,
+        default=10240,
+        help="Maximum model length (tokens) for the VLLM server.",
+    )
     parser.add_argument("--force", action="store_true", default=False, help="Force regenerating of output files, even if they already exist")
     parser.add_argument("--parallel", type=int, default=1, help="Maximum number of concurrent tasks")
     parser.add_argument(
@@ -251,10 +270,10 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     # --- START CHANGES 1 ---
-    # แก้ไข path ของ olmocr_pipeline ให้เป็น file path
+    # **สำคัญ** แก้ไข path ของ olmocr_pipeline ให้ชี้ไปยังไฟล์ใหม่
     available_methods = {
-        # **สำคัญ** ให้แน่ใจว่า path นี้ถูกต้องตามโครงสร้างโปรเจกต์ของคุณ
-        "olmocr_pipeline": ("bench.runners.run_olmocr_pipeline", "run_olmocr_pipeline"),
+        "eval_pipeline": ("bench.runners.run_eval_pipeline", "run_eval_pipeline"),
+        "olmocr_pipeline": ("bench.runners.run_olmocr_pipeline.py", "run_eval_pipeline"),
         "gotocr": ("olmocr.bench.runners.run_gotocr", "run_gotocr"),
         "nanonetsocr": ("olmocr.bench.runners.run_nanonetsocr", "run_nanonetsocr"),
         "marker": ("olmocr.bench.runners.run_marker", "run_marker"),
@@ -274,9 +293,13 @@ if __name__ == "__main__":
         method_name, extra_kwargs, folder_name = parse_method_arg(method_arg)
         if method_name not in available_methods:
             parser.error(f"Unknown method: {method_name}. " f"Available methods: {', '.join(available_methods.keys())}")
-        
+
+        # ถ้า method คือ eval_pipeline, เพิ่ม model จาก args เข้าไปใน kwargs
+        if method_name == "eval_pipeline":
+            extra_kwargs["model"] = args.model
+
         path_or_module, function_name = available_methods[method_name]
-        
+
         # --- START CHANGES 2 ---
         # เพิ่มเงื่อนไขเพื่อโหลดโมดูลตามประเภท (path หรือ module name)
         if path_or_module.endswith(".py"):
@@ -290,29 +313,31 @@ if __name__ == "__main__":
             # โหลดแบบปกติ (จาก library)
             module = importlib.import_module(path_or_module)
             function = getattr(module, function_name)
-        
+
         config[method_name] = {"method": function, "kwargs": extra_kwargs, "folder_name": folder_name}
-    
+
     data_directory = args.dir
     pdf_directory = os.path.join(data_directory, "pdfs")
 
     # --- VLLM SERVER MANAGEMENT START ---
     vllm_process = None
-    # เช็คว่าผู้ใช้ต้องการรัน olmocr_pipeline หรือไม่
-    run_vllm = any(parse_method_arg(m)[0] == 'olmocr_pipeline' for m in args.methods)
+    
+    run_vllm = any(parse_method_arg(m)[0] == 'eval_pipeline' for m in args.methods)
 
     if run_vllm:
-        print("`olmocr_pipeline` method requested. Starting VLLM server...")
+        print(f"`eval_pipeline` method requested. Starting VLLM server with model '{args.model}'...")
         # ใช้ sys.executable เพื่อให้แน่ใจว่าใช้ python interpreter เดียวกัน
+        # --- MODIFIED COMMAND ---
         command = [
             sys.executable, "-m", "vllm.entrypoints.openai.api_server",
-            "--model", "allenai/olmOCR-7B-0225-preview",
+            "--model", args.model,
             "--trust-remote-code",
-            "--gpu-memory-utilization", "0.70"
+            "--gpu-memory-utilization", str(args.gpu_memory_utilization),
+            "--max-model-len", str(args.max_model_len),
         ]
         # เริ่ม VLLM server เป็น background process
         vllm_process = subprocess.Popen(command)
-    
+
     try:
         if vllm_process:
             # รอให้ server พร้อม
